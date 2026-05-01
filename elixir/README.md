@@ -100,6 +100,8 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  max_session_total_tokens: 250000
+  continuation_token_budget_ratio: 0.85
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -121,6 +123,13 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `codex.max_session_total_tokens` and `codex.max_session_runtime_ms` are hard safety caps. When a
+  running worker reports usage above either cap, Symphony moves the issue to `tracker.block_state`
+  and terminates the task instead of letting the session keep spending budget.
+- `codex.continuation_token_budget_ratio` controls preflight for follow-up turns. Default `0.85`
+  means Symphony will not start another back-to-back Codex turn once the tracked session total is at
+  or above 85% of `codex.max_session_total_tokens`; the worker records the budget stop and moves the
+  issue to `tracker.block_state`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

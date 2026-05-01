@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:block_state, :string, default: "Todo")
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -59,7 +60,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :block_state, :terminal_states],
         empty_values: []
       )
     end
@@ -174,6 +175,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:max_session_runtime_ms, :integer, default: 1_800_000)
+      field(:max_session_total_tokens, :integer, default: 250_000)
+      field(:continuation_token_budget_ratio, :float, default: 0.85)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -188,7 +192,10 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :max_session_runtime_ms,
+          :max_session_total_tokens,
+          :continuation_token_budget_ratio
         ],
         empty_values: []
       )
@@ -196,6 +203,12 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:max_session_runtime_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:max_session_total_tokens, greater_than_or_equal_to: 0)
+      |> validate_number(:continuation_token_budget_ratio,
+        greater_than: 0,
+        less_than_or_equal_to: 1
+      )
     end
   end
 

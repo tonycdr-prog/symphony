@@ -175,8 +175,12 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        state =
+          %{state | running: Map.put(running, issue_id, updated_running_entry)}
+          |> enforce_running_budget_guardrail(issue_id)
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -196,8 +200,12 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
+        state =
+          %{state | running: Map.put(running, issue_id, updated_running_entry)}
+          |> enforce_running_budget_guardrail(issue_id)
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -444,6 +452,65 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
     end
   end
+
+  defp enforce_running_budget_guardrail(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        state
+
+      running_entry ->
+        case running_budget_violation(running_entry) do
+          nil -> state
+          reason -> halt_running_issue_for_budget(state, issue_id, running_entry, reason)
+        end
+    end
+  end
+
+  defp running_budget_violation(running_entry) when is_map(running_entry) do
+    settings = Config.settings!().codex
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    runtime_ms = running_runtime_ms(running_entry)
+
+    cond do
+      positive_integer?(settings.max_session_total_tokens) and total_tokens > settings.max_session_total_tokens ->
+        "codex.max_session_total_tokens exceeded: #{total_tokens}/#{settings.max_session_total_tokens}"
+
+      positive_integer?(settings.max_session_runtime_ms) and is_integer(runtime_ms) and
+          runtime_ms > settings.max_session_runtime_ms ->
+        "codex.max_session_runtime_ms exceeded: #{runtime_ms}/#{settings.max_session_runtime_ms}"
+
+      true ->
+        nil
+    end
+  end
+
+  defp running_budget_violation(_running_entry), do: nil
+
+  defp halt_running_issue_for_budget(%State{} = state, issue_id, running_entry, reason) do
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    session_id = running_entry_session_id(running_entry)
+    block_state = Config.settings!().tracker.block_state || "Todo"
+
+    Logger.warning("Budget guardrail stopped issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}: #{reason}; moving to #{inspect(block_state)}")
+
+    case Tracker.update_issue_state(issue_id, block_state) do
+      :ok ->
+        :ok
+
+      {:error, update_reason} ->
+        Logger.error("Budget guardrail could not move issue_id=#{issue_id} issue_identifier=#{identifier} to #{inspect(block_state)}: #{inspect(update_reason)}")
+    end
+
+    terminate_running_issue(state, issue_id, false)
+  end
+
+  defp running_runtime_ms(%{started_at: %DateTime{} = started_at}) do
+    DateTime.diff(DateTime.utc_now(), started_at, :millisecond)
+  end
+
+  defp running_runtime_ms(_running_entry), do: nil
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
@@ -1184,7 +1251,7 @@ defmodule SymphonyElixir.Orchestrator do
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
-        session_id: session_id_for_update(running_entry.session_id, update),
+        session_id: session_id_for_update(Map.get(running_entry, :session_id), update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1193,7 +1260,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+        turn_count: turn_count_for_update(turn_count, Map.get(running_entry, :session_id), update)
       }),
       token_delta
     }
@@ -1440,7 +1507,11 @@ defmodule SymphonyElixir.Orchestrator do
       [:tokenUsage, :total]
     ]
 
-    explicit_map_at_paths(payload, absolute_paths)
+    if integer_token_map?(payload) do
+      payload
+    else
+      explicit_map_at_paths(payload, absolute_paths)
+    end
   end
 
   defp absolute_token_usage_from_payload(_payload), do: nil
