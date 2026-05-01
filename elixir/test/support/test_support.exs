@@ -220,7 +220,8 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
-  defp yaml_value(value) when is_float(value), do: :erlang.float_to_binary(value, decimals: 2)
+  defp yaml_value(value) when is_float(value),
+    do: :erlang.float_to_binary(value, [:compact, decimals: 16])
   defp yaml_value(true), do: "true"
   defp yaml_value(false), do: "false"
   defp yaml_value(nil), do: "null"
