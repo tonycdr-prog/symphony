@@ -17,6 +17,8 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.codex.max_session_total_tokens == 250_000
+    assert config.codex.continuation_token_budget_ratio == 0.85
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -69,6 +71,10 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_thread_sandbox: "unsafe-ish")
     assert :ok = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_continuation_token_budget_ratio: 1.5)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.continuation_token_budget_ratio"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: ["relative/path"]}
@@ -1234,6 +1240,61 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "codex token budget guardrail stops a running issue and moves it to the block state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_block_state: "Todo",
+      codex_max_session_total_tokens: 100,
+      codex_max_session_runtime_ms: 0
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_recipient) end)
+
+    issue_id = "issue-budget"
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    ref = Process.monitor(worker_pid)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: worker_pid,
+          ref: ref,
+          identifier: "MT-562",
+          issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+          started_at: DateTime.utc_now(),
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    update = %{
+      event: :notification,
+      timestamp: DateTime.utc_now(),
+      usage: %{"inputTokens" => 90, "outputTokens" => 20, "totalTokens" => 110}
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, update}, state)
+
+    assert updated_state.running == %{}
+    assert updated_state.claimed == MapSet.new()
+    assert updated_state.retry_attempts == %{}
+    assert updated_state.codex_totals.total_tokens == 110
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Todo"}
+    refute Process.alive?(worker_pid)
+  end
+
   test "agent runner continues with a follow-up turn while the issue remains active" do
     test_root =
       Path.join(
@@ -1361,6 +1422,109 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner stops before continuation when tracked token budget is nearly exhausted" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-budget"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-budget-1"}}}'
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":70,"outputTokens":20,"totalTokens":90}}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-budget-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      on_exit(fn ->
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_block_state: "Todo",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        codex_max_session_total_tokens: 100,
+        codex_continuation_token_budget_ratio: 0.8,
+        max_turns: 3
+      )
+
+      issue = %Issue{
+        id: "issue-budget-stop",
+        identifier: "MT-249",
+        title: "Stop before token runaway",
+        description: "Still active after first turn",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "In Progress"}]} end
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert_receive {:memory_tracker_state_update, "issue-budget-stop", "Todo"}
+
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+
+      turn_starts =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+
+      assert length(turn_starts) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
       File.rm_rf(test_root)
     end
   end

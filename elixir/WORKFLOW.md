@@ -32,6 +32,9 @@ codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  max_session_runtime_ms: 900000
+  max_session_total_tokens: 150000
+  continuation_token_budget_ratio: 0.85
   turn_sandbox_policy:
     type: workspaceWrite
 ---
